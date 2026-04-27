@@ -26,6 +26,14 @@
 
 ## 用法
 
+下载安装:
+
+保存仓库的`1panel-cert-update`到 `/usr/bin` 下，赋予执行权限
+
+```bash
+chmod +x /usr/bin/1panel-cert-update
+```
+
 首次配置:
 
 ```bash
