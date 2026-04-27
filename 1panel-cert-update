@@ -1,0 +1,698 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM_NAME=${0##*/}
+WORKDIR=${ONEPANEL_WORKDIR:-/opt/1panel-cert-update}
+CONFIG_FILE=${ONEPANEL_CONFIG_FILE:-$WORKDIR/config.env}
+
+DEFAULT_CERT_PEM_PATH='/opt/1panel-cert-update/cert.pem'
+DEFAULT_CERT_KEY_PATH='/opt/1panel-cert-update/cert.key'
+DEFAULT_SSL_DESCRIPTION='managed by 1panel-cert-update'
+
+PANEL_URL=''
+API_KEY=''
+SSL_IDS=''
+SSL_DESCRIPTION=$DEFAULT_SSL_DESCRIPTION
+CERT_PEM_PATH=$DEFAULT_CERT_PEM_PATH
+CERT_KEY_PATH=$DEFAULT_CERT_KEY_PATH
+
+TMPDIR=
+
+log() {
+    printf '%s\n' "$*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+cleanup() {
+    if [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; then
+        rm -rf "$TMPDIR"
+    fi
+}
+
+trap cleanup EXIT
+
+usage() {
+    cat <<'EOF'
+Usage:
+  1panel-cert-update                Upload cert.pem/cert.key to the configured SSL record(s)
+  1panel-cert-update run            Same as the default command
+  1panel-cert-update list           List SSL records from 1Panel
+  1panel-cert-update config         Prompt endpoint/key/path(s), then choose one or more SSL records
+  1panel-cert-update config --ssl-ids ID[,ID...]
+  1panel-cert-update bootstrap      Create a dedicated managed SSL record and save it to config
+  1panel-cert-update show-config    Show the current effective configuration
+  1panel-cert-update help
+
+Environment overrides:
+  ONEPANEL_WORKDIR
+  ONEPANEL_CONFIG_FILE
+  ONEPANEL_PANEL_URL
+  ONEPANEL_API_KEY
+  ONEPANEL_SSL_IDS
+  ONEPANEL_SSL_DESCRIPTION
+  ONEPANEL_CERT_PEM_PATH
+  ONEPANEL_CERT_KEY_PATH
+EOF
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+ensure_tmpdir() {
+    if [ -z "${TMPDIR:-}" ]; then
+        TMPDIR=$(mktemp -d)
+    fi
+}
+
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$CONFIG_FILE"
+    fi
+
+    PANEL_URL=${ONEPANEL_PANEL_URL:-$PANEL_URL}
+    API_KEY=${ONEPANEL_API_KEY:-$API_KEY}
+    if [ -z "${SSL_IDS:-}" ] && [ -n "${SSL_ID:-}" ]; then
+        SSL_IDS=$SSL_ID
+    fi
+    SSL_IDS=${ONEPANEL_SSL_IDS:-$SSL_IDS}
+    SSL_DESCRIPTION=${ONEPANEL_SSL_DESCRIPTION:-$SSL_DESCRIPTION}
+    CERT_PEM_PATH=${ONEPANEL_CERT_PEM_PATH:-$CERT_PEM_PATH}
+    CERT_KEY_PATH=${ONEPANEL_CERT_KEY_PATH:-$CERT_KEY_PATH}
+    PANEL_URL=${PANEL_URL%/}
+}
+
+save_config() {
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    umask 077
+    {
+        printf 'PANEL_URL=%q\n' "$PANEL_URL"
+        printf 'API_KEY=%q\n' "$API_KEY"
+        printf 'SSL_IDS=%q\n' "$SSL_IDS"
+        printf 'SSL_DESCRIPTION=%q\n' "$SSL_DESCRIPTION"
+        printf 'CERT_PEM_PATH=%q\n' "$CERT_PEM_PATH"
+        printf 'CERT_KEY_PATH=%q\n' "$CERT_KEY_PATH"
+    } >"$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+trim() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+prompt_value() {
+    label=$1
+    current=$2
+
+    if [ -n "$current" ]; then
+        printf '%s [%s]: ' "$label" "$current" >&2
+    else
+        printf '%s: ' "$label" >&2
+    fi
+    read -r answer
+    if [ -n "$answer" ]; then
+        printf '%s' "$answer"
+        return
+    fi
+    printf '%s' "$current"
+}
+
+prompt_secret() {
+    label=$1
+    current=$2
+
+    if [ -n "$current" ]; then
+        printf '%s [press Enter to keep current]: ' "$label" >&2
+    else
+        printf '%s: ' "$label" >&2
+    fi
+    read -r answer
+    if [ -n "$answer" ]; then
+        printf '%s' "$answer"
+        return
+    fi
+    printf '%s' "$current"
+}
+
+prompt_required_value() {
+    label=$1
+
+    printf '%s: ' "$label" >&2
+    read -r answer
+    answer=$(trim "$answer")
+    [ -n "$answer" ] || die "$label cannot be empty"
+    printf '%s' "$answer"
+}
+
+prompt_required_secret() {
+    label=$1
+
+    printf '%s: ' "$label" >&2
+    read -r answer
+    answer=$(trim "$answer")
+    [ -n "$answer" ] || die "$label cannot be empty"
+    printf '%s' "$answer"
+}
+
+csv_contains() {
+    csv=$1
+    value=$2
+    case ",$csv," in
+        *,"$value",*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+csv_append_unique() {
+    csv=$1
+    value=$2
+
+    if [ -z "$value" ]; then
+        printf '%s' "$csv"
+        return
+    fi
+    if [ -n "$csv" ] && csv_contains "$csv" "$value"; then
+        printf '%s' "$csv"
+        return
+    fi
+    if [ -n "$csv" ]; then
+        printf '%s,%s' "$csv" "$value"
+        return
+    fi
+    printf '%s' "$value"
+}
+
+json_escape_string() {
+    printf '%s' "$1" | awk '
+        BEGIN { printf "\"" }
+        {
+            gsub(/\\/,"\\\\")
+            gsub(/"/,"\\\"")
+            gsub(/\r/,"\\r")
+            gsub(/\t/,"\\t")
+            printf "%s", $0
+        }
+        END { printf "\"" }
+    '
+}
+
+json_escape_file() {
+    awk '
+        BEGIN { printf "\"" }
+        {
+            gsub(/\\/,"\\\\")
+            gsub(/"/,"\\\"")
+            gsub(/\r/,"\\r")
+            printf "%s\\n", $0
+        }
+        END { printf "\"" }
+    ' "$1"
+}
+
+calc_md5() {
+    if command -v md5sum >/dev/null 2>&1; then
+        printf '%s' "$1" | md5sum | awk '{print $1}'
+        return
+    fi
+    if command -v openssl >/dev/null 2>&1; then
+        printf '%s' "$1" | openssl md5 | sed 's/^.* //'
+        return
+    fi
+    die "missing command: md5sum or openssl"
+}
+
+make_token() {
+    ts=$1
+    calc_md5 "1panel${API_KEY}${ts}"
+}
+
+api_request() {
+    method=$1
+    path=$2
+    body_file=${3:-}
+
+    [ -n "$API_KEY" ] || die "API_KEY is empty, run '$PROGRAM_NAME config' or edit $CONFIG_FILE"
+
+    ts=$(date +%s)
+    token=$(make_token "$ts")
+    url="${PANEL_URL}/api/v1${path}"
+
+    if [ -n "$body_file" ]; then
+        curl -k -sS \
+            -H "1Panel-Token: $token" \
+            -H "1Panel-Timestamp: $ts" \
+            -H 'Content-Type: application/json' \
+            -X "$method" \
+            --data-binary @"$body_file" \
+            "$url"
+        return
+    fi
+
+    curl -k -sS \
+        -H "1Panel-Token: $token" \
+        -H "1Panel-Timestamp: $ts" \
+        -X "$method" \
+        "$url"
+}
+
+response_code() {
+    sed -n 's/.*"code":\([0-9][0-9]*\).*/\1/p' "$1" | head -n 1
+}
+
+response_message() {
+    sed -n 's/.*"message":"\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+fetch_ssl_search() {
+    ensure_tmpdir
+    body_file="$TMPDIR/ssl-search.json"
+    cat >"$body_file" <<'EOF'
+{"page":1,"pageSize":200}
+EOF
+    api_request POST '/websites/ssl/search' "$body_file"
+}
+
+extract_ssl_items() {
+    awk '
+        BEGIN {
+            in_string = 0
+            escape = 0
+            depth = 0
+        }
+        {
+            data = data $0
+        }
+        END {
+            marker = "\"items\":["
+            start = index(data, marker)
+            if (!start) {
+                exit 1
+            }
+            i = start + length(marker)
+            n = length(data)
+            while (i <= n) {
+                c = substr(data, i, 1)
+                if (c == "]") {
+                    break
+                }
+                if (c != "{") {
+                    i++
+                    continue
+                }
+
+                item = ""
+                depth = 0
+                in_string = 0
+                escape = 0
+                while (i <= n) {
+                    c = substr(data, i, 1)
+                    item = item c
+                    if (in_string) {
+                        if (escape) {
+                            escape = 0
+                        } else if (c == "\\") {
+                            escape = 1
+                        } else if (c == "\"") {
+                            in_string = 0
+                        }
+                    } else {
+                        if (c == "\"") {
+                            in_string = 1
+                        } else if (c == "{") {
+                            depth++
+                        } else if (c == "}") {
+                            depth--
+                            if (depth == 0) {
+                                print item
+                                i++
+                                break
+                            }
+                        }
+                    }
+                    i++
+                }
+            }
+        }
+    ' "$1"
+}
+
+ssl_items_to_tsv() {
+    awk '
+        function json_string(name, s, key, start, rest, out, i, c, esc) {
+            key = "\"" name "\":"
+            start = index(s, key)
+            if (!start) {
+                return ""
+            }
+            rest = substr(s, start + length(key))
+            if (substr(rest, 1, 1) != "\"") {
+                return ""
+            }
+            rest = substr(rest, 2)
+            out = ""
+            esc = 0
+            for (i = 1; i <= length(rest); i++) {
+                c = substr(rest, i, 1)
+                if (esc) {
+                    if (c == "n") {
+                        out = out "\\n"
+                    } else if (c == "t") {
+                        out = out "\t"
+                    } else {
+                        out = out c
+                    }
+                    esc = 0
+                } else if (c == "\\") {
+                    esc = 1
+                } else if (c == "\"") {
+                    break
+                } else {
+                    out = out c
+                }
+            }
+            return out
+        }
+        function json_number(name, s, key, start, rest, out, i, c) {
+            key = "\"" name "\":"
+            start = index(s, key)
+            if (!start) {
+                return ""
+            }
+            rest = substr(s, start + length(key))
+            out = ""
+            for (i = 1; i <= length(rest); i++) {
+                c = substr(rest, i, 1)
+                if (c ~ /[0-9]/) {
+                    out = out c
+                } else {
+                    break
+                }
+            }
+            return out
+        }
+        {
+            id = json_number("id", $0)
+            domain = json_string("primaryDomain", $0)
+            provider = json_string("provider", $0)
+            status = json_string("status", $0)
+            expire = json_string("expireDate", $0)
+            desc = json_string("description", $0)
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n", id, domain, provider, status, expire, desc
+        }
+    '
+}
+
+list_ssl_records() {
+    ensure_tmpdir
+    response_file="$TMPDIR/ssl-list-response.json"
+    fetch_ssl_search >"$response_file"
+
+    code=$(response_code "$response_file")
+    [ "$code" = "200" ] || die "list ssl failed: $(response_message "$response_file")"
+
+    items_file="$TMPDIR/ssl-items.tsv"
+    extract_ssl_items "$response_file" | ssl_items_to_tsv >"$items_file"
+
+    awk -F '\t' -v current_ids="$SSL_IDS" '
+        function contains(csv, id) {
+            return index("," csv ",", "," id ",") > 0
+        }
+        BEGIN {
+            printf "%-4s %-6s %-32s %-12s %-10s %-20s %s\n", "No.", "ID", "PrimaryDomain", "Provider", "Status", "ExpireDate", "Description"
+        }
+        {
+            row++
+            domain = $2
+            if (domain == "") {
+                domain = "-"
+            }
+            desc = $6
+            if ($2 == "" && desc != "") {
+                domain = "[" desc "]"
+            }
+            marker = (contains(current_ids, $1) ? "*" : " ")
+            printf "%-4s %-6s %-32s %-12s %-10s %-20s %s\n", marker row, $1, domain, $3, $4, $5, desc
+        }
+    ' "$items_file"
+}
+
+prompt_config_values() {
+    PANEL_URL=$(prompt_required_value '1Panel endpoint')
+    API_KEY=$(prompt_required_secret '1Panel API key')
+    CERT_PEM_PATH=$(trim "$(prompt_value 'Certificate path' "$CERT_PEM_PATH")")
+    CERT_KEY_PATH=$(trim "$(prompt_value 'Private key path' "$CERT_KEY_PATH")")
+    SSL_DESCRIPTION=$(trim "$(prompt_value 'Managed record description' "$SSL_DESCRIPTION")")
+
+    [ -n "$CERT_PEM_PATH" ] || die "certificate path cannot be empty"
+    [ -n "$CERT_KEY_PATH" ] || die "private key path cannot be empty"
+    [ -n "$SSL_DESCRIPTION" ] || SSL_DESCRIPTION=$DEFAULT_SSL_DESCRIPTION
+    PANEL_URL=${PANEL_URL%/}
+}
+
+choose_ssl_records() {
+    ensure_tmpdir
+    response_file="$TMPDIR/ssl-config-response.json"
+    fetch_ssl_search >"$response_file"
+
+    code=$(response_code "$response_file")
+    [ "$code" = "200" ] || die "list ssl failed: $(response_message "$response_file")"
+
+    items_file="$TMPDIR/ssl-config-items.tsv"
+    extract_ssl_items "$response_file" | ssl_items_to_tsv >"$items_file"
+    [ -s "$items_file" ] || die "no ssl records returned by 1Panel"
+
+    awk -F '\t' -v current_ids="$SSL_IDS" '
+        function contains(csv, id) {
+            return index("," csv ",", "," id ",") > 0
+        }
+        BEGIN {
+            printf "%-4s %-6s %-32s %-12s %-10s %-20s %s\n", "No.", "ID", "PrimaryDomain", "Provider", "Status", "ExpireDate", "Description"
+        }
+        {
+            row++
+            domain = $2
+            if (domain == "") {
+                domain = "-"
+            }
+            desc = $6
+            if ($2 == "" && desc != "") {
+                domain = "[" desc "]"
+            }
+            marker = (contains(current_ids, $1) ? "*" : " ")
+            printf "%-4s %-6s %-32s %-12s %-10s %-20s %s\n", marker row, $1, domain, $3, $4, $5, desc
+        }
+    ' "$items_file"
+
+    if [ -n "$SSL_IDS" ]; then
+        log "Current SSL_IDS: $SSL_IDS"
+    fi
+
+    printf 'Select row number(s) or SSL ID(s), comma separated. Use all for every record: ' >&2
+    read -r selection
+    [ -n "$selection" ] || die "selection is empty"
+
+    selected_ids=''
+    if [ "$selection" = "all" ]; then
+        while IFS=$'\t' read -r ssl_id _; do
+            selected_ids=$(csv_append_unique "$selected_ids" "$ssl_id")
+        done <"$items_file"
+    else
+        IFS=',' read -r -a tokens <<<"$selection"
+        for raw_token in "${tokens[@]}"; do
+            token=$(trim "$raw_token")
+            [ -n "$token" ] || continue
+            ssl_id=$(
+                awk -F '\t' -v selection="$token" '
+                    {
+                        row++
+                        if (selection == row || selection == $1) {
+                            print $1
+                            exit
+                        }
+                    }
+                ' "$items_file"
+            )
+            [ -n "$ssl_id" ] || die "invalid selection: $token"
+            selected_ids=$(csv_append_unique "$selected_ids" "$ssl_id")
+        done
+    fi
+
+    [ -n "$selected_ids" ] || die "no ssl records selected"
+    SSL_IDS=$selected_ids
+
+    save_config
+    log "Saved SSL_IDS=$SSL_IDS to $CONFIG_FILE"
+}
+
+write_upload_body() {
+    target_file=$1
+    ssl_id=$2
+    cert_json=$(json_escape_file "$CERT_PEM_PATH")
+    key_json=$(json_escape_file "$CERT_KEY_PATH")
+    desc_json=$(json_escape_string "$SSL_DESCRIPTION")
+    printf '{"sslID":%s,"type":"paste","description":%s,"certificate":%s,"privateKey":%s}\n' \
+        "$ssl_id" "$desc_json" "$cert_json" "$key_json" >"$target_file"
+}
+
+run_update() {
+    [ -n "$SSL_IDS" ] || die "SSL_IDS is empty, run '$PROGRAM_NAME config' first"
+    [ -f "$CERT_PEM_PATH" ] || die "certificate file not found: $CERT_PEM_PATH"
+    [ -f "$CERT_KEY_PATH" ] || die "private key file not found: $CERT_KEY_PATH"
+
+    ensure_tmpdir
+    IFS=',' read -r -a ssl_ids <<<"$SSL_IDS"
+    for ssl_id in "${ssl_ids[@]}"; do
+        ssl_id=$(trim "$ssl_id")
+        [ -n "$ssl_id" ] || continue
+
+        body_file="$TMPDIR/upload-${ssl_id}.json"
+        response_file="$TMPDIR/upload-${ssl_id}.response.json"
+
+        write_upload_body "$body_file" "$ssl_id"
+        api_request POST '/websites/ssl/upload' "$body_file" >"$response_file"
+
+        code=$(response_code "$response_file")
+        [ "$code" = "200" ] || die "upload failed for SSL_ID=$ssl_id: $(response_message "$response_file")"
+
+        log "Updated SSL_ID=$ssl_id from $CERT_PEM_PATH and $CERT_KEY_PATH"
+    done
+}
+
+bootstrap_self_signed() {
+    target_cert=$1
+    target_key=$2
+    need_cmd openssl
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+        -subj '/CN=1panel-cert-update.local.invalid' \
+        -keyout "$target_key" \
+        -out "$target_cert" >/dev/null 2>&1
+}
+
+bootstrap_record() {
+    ensure_tmpdir
+    cert_source=$CERT_PEM_PATH
+    key_source=$CERT_KEY_PATH
+    cleanup_generated=0
+
+    if [ ! -f "$cert_source" ] || [ ! -f "$key_source" ]; then
+        cert_source="$TMPDIR/bootstrap-cert.pem"
+        key_source="$TMPDIR/bootstrap-key.pem"
+        bootstrap_self_signed "$cert_source" "$key_source"
+        cleanup_generated=1
+    fi
+
+    cert_json=$(json_escape_file "$cert_source")
+    key_json=$(json_escape_file "$key_source")
+    desc_json=$(json_escape_string "$DEFAULT_SSL_DESCRIPTION")
+    body_file="$TMPDIR/bootstrap-body.json"
+    response_file="$TMPDIR/bootstrap-response.json"
+
+    printf '{"type":"paste","description":%s,"certificate":%s,"privateKey":%s}\n' \
+        "$desc_json" "$cert_json" "$key_json" >"$body_file"
+
+    api_request POST '/websites/ssl/upload' "$body_file" >"$response_file"
+
+    code=$(response_code "$response_file")
+    [ "$code" = "200" ] || die "bootstrap failed: $(response_message "$response_file")"
+
+    search_file="$TMPDIR/bootstrap-search.json"
+    fetch_ssl_search >"$search_file"
+    code=$(response_code "$search_file")
+    [ "$code" = "200" ] || die "bootstrap verify failed: $(response_message "$search_file")"
+
+    created_ssl_id=$(
+        extract_ssl_items "$search_file" | ssl_items_to_tsv | awk -F '\t' -v desc="$DEFAULT_SSL_DESCRIPTION" '
+            $6 == desc {
+                id = $1
+            }
+            END {
+                print id
+            }
+        '
+    )
+    [ -n "$created_ssl_id" ] || die "bootstrap verify failed: cannot find the newly created ssl record"
+
+    SSL_IDS=$created_ssl_id
+    SSL_DESCRIPTION=$DEFAULT_SSL_DESCRIPTION
+    save_config
+
+    if [ "$cleanup_generated" = "1" ]; then
+        log "Created dedicated SSL record SSL_ID=$created_ssl_id using a temporary self-signed certificate"
+    else
+        log "Created dedicated SSL record SSL_ID=$created_ssl_id using $CERT_PEM_PATH"
+    fi
+}
+
+show_config() {
+    cat <<EOF
+PROGRAM_NAME=$PROGRAM_NAME
+WORKDIR=$WORKDIR
+CONFIG_FILE=$CONFIG_FILE
+PANEL_URL=$PANEL_URL
+SSL_IDS=$SSL_IDS
+SSL_DESCRIPTION=$SSL_DESCRIPTION
+CERT_PEM_PATH=$CERT_PEM_PATH
+CERT_KEY_PATH=$CERT_KEY_PATH
+API_KEY_SET=$( [ -n "$API_KEY" ] && printf yes || printf no )
+EOF
+}
+
+main() {
+    need_cmd curl
+    need_cmd awk
+    need_cmd sed
+
+    load_config
+
+    cmd=${1:-run}
+    case "$cmd" in
+        run)
+            run_update
+            ;;
+        list)
+            list_ssl_records
+            ;;
+        config)
+            shift || true
+            if [ "${1:-}" = "--ssl-id" ]; then
+                [ -n "${2:-}" ] || die "missing value after --ssl-id"
+                SSL_IDS=$2
+                save_config
+                log "Saved SSL_IDS=$SSL_IDS to $CONFIG_FILE"
+                return
+            fi
+            if [ "${1:-}" = "--ssl-ids" ]; then
+                [ -n "${2:-}" ] || die "missing value after --ssl-ids"
+                SSL_IDS=$2
+                save_config
+                log "Saved SSL_IDS=$SSL_IDS to $CONFIG_FILE"
+                return
+            fi
+            prompt_config_values
+            choose_ssl_records
+            ;;
+        bootstrap)
+            bootstrap_record
+            ;;
+        show-config)
+            show_config
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            die "unknown command: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
